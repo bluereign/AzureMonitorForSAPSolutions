@@ -9,12 +9,18 @@
 # Python modules
 from abc import ABC, abstractmethod
 import argparse
+from concurrent.futures import ThreadPoolExecutor
+import concurrent.futures
+from datetime import date, datetime, timedelta, timezone
 import json
 import os
 import re
 import sys
 import threading
+from time import sleep, time
 import traceback
+from typing import Dict
+
 
 # Payload modules
 from const import *
@@ -26,42 +32,50 @@ from helper.providerfactory import *
 from helper.updateprofile import *
 from helper.updatefactory import *
 
+# global flag to signal to any threads they should complete so python process can exit
+isShuttingDown = False 
+
 ###############################################################################
 
-class ProviderInstanceThread(threading.Thread):
-   def __init__(self, providerInstance):
-      threading.Thread.__init__(self)
-      self.providerInstance = providerInstance
+def runCheck(check):
+   global ctx, tracer
 
-   def run(self):
-      global ctx, tracer
-      for check in self.providerInstance.checks:
-         tracer.info("starting check %s" % (check.fullName))
-
-         # Skip this check if it's not enabled or not due yet
-         if (check.isEnabled() == False) or (check.isDue() == False):
-            continue
-
-         # Run all actions that are part of this check
+   wasSuccessful = True
+   try:
+      # Run all actions that are part of this check
+      try:
          resultJson = check.run()
+      except Exception as e:
+         # unhandled exception from check.run() means the action was not successful
+         # and the resultJson string will either be uninitialized or will 
+         tracer.error("[%s] failed check due to exception: %s", check.fullName, e, exc_info=True)
+         wasSuccessful = False
 
-         # Ingest result into Log Analytics
-         ctx.azLa.ingest(check.customLog,
-                         resultJson,
-                         check.colTimeGenerated)
+      # Persist updated internal state to provider state file, regardless of whether check succeeded or failed
+      check.providerInstance.writeState()
 
-         # Persist updated internal state to provider state file
-         self.providerInstance.writeState()
+      if not wasSuccessful:
+         # if check action failed, then we can return early since there will be no valid resultJson to emit to Log Analytics
+         return
 
-         # Ingest result into Customer Analytics
-         enableCustomerAnalytics = ctx.globalParams.get("enableCustomerAnalytics", True)
-         if enableCustomerAnalytics and check.includeInCustomerAnalytics:
-             tracing.ingestCustomerAnalytics(tracer,
-                                             ctx,
-                                             check.customLog,
-                                             resultJson)
-         tracer.info("finished check %s" % (check.fullName))
-      return
+      # Ingest result into Log Analytics
+      ctx.azLa.ingest(check.customLog,
+                        resultJson,
+                        check.colTimeGenerated)
+
+      # Ingest result into Customer Analytics
+      enableCustomerAnalytics = ctx.globalParams.get("enableCustomerAnalytics", True)
+      if enableCustomerAnalytics and check.includeInCustomerAnalytics:
+            tracing.ingestCustomerAnalytics(tracer,
+                                          ctx,
+                                          check.customLog,
+                                          resultJson)
+      tracer.info("finished check %s" % (check.fullName))
+   except Exception as e:
+      tracer.error("[%s] unhandled exception in runCheck: %s", check.fullName, e, exc_info=True)
+      raise
+   finally:
+      ctx.checkLockSet.remove(check.getLockName())
 
 ###############################################################################
 
@@ -171,6 +185,7 @@ def addProvider(args: str = None,
    if not saveInstanceToConfig(instanceProperties):
       tracer.error("could not save provider instance %s to KeyVault" % newProviderInstance.fullName)
       sys.exit(ERROR_ADDING_PROVIDER)
+   open(FILENAME_REFRESH, "w")
    tracer.info("successfully added provider instance %s to KeyVault" % newProviderInstance.fullName)
    return True
 
@@ -200,6 +215,7 @@ def deleteProvider(args: str) -> None:
       if not ctx.azKv.deleteSecret(secretToDelete):
          tracer.error("error deleting KeyVault secret %s (already marked for deletion?)" % secretToDelete)
       else:
+         open(FILENAME_REFRESH, "w")
          tracer.info("provider %s successfully deleted from KeyVault" % secretToDelete)
    return
 
@@ -208,28 +224,69 @@ def monitor(args: str) -> None:
    global ctx, tracer
    tracer.info("starting monitor payload")
 
-   threads = []
-   if not loadConfig():
-      tracer.critical("failed to load config from KeyVault")
-      sys.exit(ERROR_LOADING_CONFIG)
-   logAnalyticsWorkspaceId = ctx.globalParams.get("logAnalyticsWorkspaceId", None)
-   logAnalyticsSharedKey = ctx.globalParams.get("logAnalyticsSharedKey", None)
-   if not logAnalyticsWorkspaceId or not logAnalyticsSharedKey:
-      tracer.critical("global config must contain logAnalyticsWorkspaceId and logAnalyticsSharedKey")
-      sys.exit(ERROR_GETTING_LOG_CREDENTIALS)
-   ctx.azLa = AzureLogAnalytics(tracer,
-                                logAnalyticsWorkspaceId,
-                                logAnalyticsSharedKey)
-   for i in ctx.instances:
-      thread = ProviderInstanceThread(i)
-      thread.start()
-      threads.append(thread)
+   pool = ThreadPoolExecutor(NUMBER_OF_THREADS)
+   allChecks = []
 
-   for t in threads:
-      t.join()
+   pool.submit(heartbeat)
 
-   tracer.info("monitor payload successfully completed")
-   return
+   while True:
+      now = datetime.now()
+      secondsSinceRefresh = (now-ctx.lastConfigRefreshTime).total_seconds()
+      refresh = False
+
+      # check if config needs refresh
+      # needs refresh if 24 hours as passed or refresh file found
+      if secondsSinceRefresh > CONFIG_REFRESH_IN_SECONDS:
+         tracer.info("Config has not been refreshed in %d seconds, refreshing", secondsSinceRefresh)
+         refresh = True
+      elif os.path.isfile(FILENAME_REFRESH):
+         tracer.info("Refresh file found, refreshing")
+         refresh = True
+
+      if refresh:
+         allChecks = []
+         ctx.instances = []
+
+         if not loadConfig():
+            tracer.critical("failed to load config from KeyVault")
+            shutdownMonitor(ERROR_LOADING_CONFIG)
+         logAnalyticsWorkspaceId = ctx.globalParams.get("logAnalyticsWorkspaceId", None)
+         logAnalyticsSharedKey = ctx.globalParams.get("logAnalyticsSharedKey", None)
+         if not logAnalyticsWorkspaceId or not logAnalyticsSharedKey:
+            tracer.critical("global config must contain logAnalyticsWorkspaceId and logAnalyticsSharedKey")
+            shutdownMonitor(ERROR_GETTING_LOG_CREDENTIALS)
+         ctx.azLa = AzureLogAnalytics(tracer,
+                                      logAnalyticsWorkspaceId,
+                                      logAnalyticsSharedKey)
+
+         for i in ctx.instances:
+            for c in i.checks:
+               allChecks.append(c)
+
+         ctx.lastConfigRefreshTime = datetime.now()
+         if os.path.exists(FILENAME_REFRESH):
+            os.remove(FILENAME_REFRESH)
+
+      for check in allChecks:
+         try:
+            if check.getLockName() in ctx.checkLockSet:
+               tracer.info("[%s] already queued/executing, skipping" % check.fullName)
+               continue
+            elif not check.isEnabled():
+               tracer.info("[%s] not enabled, skipping" % check.fullName)
+               continue
+            elif not check.isDue():
+               tracer.info("[%s] not due for execution, skipping" % check.fullName)
+               continue
+            else:
+               tracer.info("[%s] getting queued" % check.fullName)
+               ctx.checkLockSet.add(check.getLockName())
+               pool.submit(runCheck, check)
+         except Exception as e:
+            tracer.error("[%s] exception determining execution state of check, %s", check.fullName, e, exc_info=True)
+
+      sleep(CHECK_WAIT_IN_SECONDS)
+
 
 # prepareUpdate will prepare the resources like keyvault, log analytics etc for the version passed as an argument
 # prepareUpdate needs to be run when a version upgrade requires specific update to the content of the resources
@@ -254,6 +311,60 @@ def ensureDirectoryStructure() -> None:
                                                                                                      e))
          sys.exit(ERROR_FILE_PERMISSION_DENIED)
    return
+
+def shutdownMonitor(status: object) -> None:
+   global isShuttingDown
+   # signal to threads we need to exit process
+   isShuttingDown = True
+   tracer.critical("signaling tasks to shutdown")
+   sys.exit(status)
+
+def heartbeat() -> None: 
+   global ctx, isShuttingDown
+
+   while not isShuttingDown:
+      providerJson = {
+         "Count": 0,
+         "Providers": []
+      }
+         
+      for i in ctx.instances:
+         pi = providerJson.get("Providers", [])
+         
+         provider = {
+            "Name": i.name,
+            "Checks": []
+         }         
+
+         for check in i.checks:
+            if check.getLockName() in ctx.checkLockSet:
+               continue
+            
+            lastRunLocal = check.state.get("lastRunLocal", None)
+            if lastRunLocal:
+               utcTime = datetime.utcnow()
+               if lastRunLocal.tzinfo:
+                  utcTime = datetime.now(timezone.utc)
+               if (lastRunLocal >= utcTime - timedelta(seconds = HEARTBEAT_WAIT_IN_SECONDS)):
+                  checks = provider.get("Checks", [])
+                  checkJson = {
+                     "Name": check.name,
+                     "Duration": check.duration,
+                     "LastRun": '{:%m/%d/%y %H:%M %S}'.format(lastRunLocal),
+                     "Success": check.success,
+                     "Message": check.checkMessage
+                  }
+                  checks.append(checkJson)
+                  provider.update({"Checks":checks})
+
+         checkCount = provider.get("Checks", [])
+         if (len(checkCount) > 0):
+            pi.append(provider)
+            providerJson.update({"Providers":pi})
+            providerJson.update({"Count": len(pi)})
+            tracer.info(json.dumps(providerJson))
+            
+      sleep(HEARTBEAT_WAIT_IN_SECONDS)
 
 # Main function with argument parser
 def main() -> None:

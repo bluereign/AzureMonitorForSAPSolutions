@@ -1,9 +1,10 @@
 # Python modules
 from abc import ABC, abstractmethod
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 import json
 import logging
 from retry.api import retry_call
+from time import time
 from typing import Callable, Dict, List, Optional
 
 # Payload modules
@@ -207,12 +208,17 @@ class ProviderCheck(ABC):
       }
       self.fullName = "%s.%s" % (self.providerInstance.fullName, self.name)
       self.tracer = providerInstance.tracer
+      self.duration = 0
+      self.success = False
+      self.checkMessage = None
+
+   # Return check name for locking
+   def getLockName(self) -> str:
+      return "%s.%s" % (self.providerInstance.fullName, self.name)
 
    # Return if this check is enabled or not
    def isEnabled(self) -> bool:
-      self.tracer.debug("[%s] verifying if check is enabled" % self.fullName)
       if not self.state["isEnabled"]:
-         self.tracer.info("[%s] check is currently not enabled, skipping" % self.fullName)
          return False
       return True
 
@@ -220,41 +226,64 @@ class ProviderCheck(ABC):
    def isDue(self) -> bool:
       # lastRunLocal = last execution time on collector VM
       # lastRunServer (used in provider) = last execution time on (HANA) server
-      self.tracer.debug("[%s] verifying if check is due to be run" % self.fullName)
       lastRunLocal = self.state.get("lastRunLocal", None)
       self.tracer.debug("[%s] lastRunLocal=%s; frequencySecs=%d; currentLocal=%s" % (self.fullName,
                                                                                      lastRunLocal,
                                                                                      self.frequencySecs,
                                                                                      datetime.utcnow()))
-      if lastRunLocal and \
-         lastRunLocal + timedelta(seconds = self.frequencySecs) > datetime.utcnow():
-         self.tracer.info("[%s] check is not due yet, skipping" % self.fullName)
-         return False
+
+      if lastRunLocal:
+         # want to support timezone naive and aware datetime comparision
+         # default to utc datetime value without actual utc time zone attribute
+         utcTime = datetime.utcnow()
+         if lastRunLocal.tzinfo:
+            # if lastRunLocal is time zone aware, then use utc datetime that has timezone populated
+            utcTime = datetime.now(timezone.utc)
+         if (lastRunLocal + timedelta(seconds = self.frequencySecs) > utcTime):
+            return False
+      
       return True
+
 
    # Method that gets called when this check is executed
    # Returns a JSON-formatted string that can be ingested into Log Analytics
-   def run(self) -> str:
-      self.tracer.info("[%s] executing all actions of check" % self.fullName)
-      self.tracer.debug("[%s] actions=%s" % (self.fullName,
-                                             self.actions))
-      for action in self.actions:
-         methodName = METHODNAME_ACTION % action["type"]
-         parameters = action.get("parameters", {})
-         self.tracer.debug("[%s] calling action %s" % (self.fullName,
-                                                       methodName))
-         method = getattr(self, methodName)
-         tries = action.get("retries", self.providerInstance.retrySettings["retries"])
-         delay = action.get("delayInSeconds", self.providerInstance.retrySettings["delayInSeconds"])
-         backoff = action.get("backoffMultiplier", self.providerInstance.retrySettings["backoffMultiplier"])
+   def run(self) -> str:      
+      startTime = time()
+      
+      # ensure lastRunTime is initialized at start of run method, rather than require all action methods to initialize it themselves
+      # (although individual action methods can overwrite with a successful run timestamp upon completion if they want)
+      # NOTE:  this ensures we do not spam logs every 5 seconds trying to rerun checks that throw unhandled exception
+      self.state['lastRunLocal'] = datetime.utcnow()
 
-         try :
-            retry_call(method, fkwargs=parameters, tries=tries, delay=delay, backoff=backoff, logger=self.tracer)
-         except Exception as e:
-            self.tracer.error("[%s] error executing action %s, Exception %s, skipping remaining actions" % (self.fullName,
-                                                                                                            methodName,
-                                                                                                            e))
-            break
+      try:
+         self.duration = 0
+         self.success = False
+         self.tracer.info("[%s] executing all actions of check" % self.fullName)
+         self.tracer.debug("[%s] actions=%s" % (self.fullName,
+                                                self.actions))
+         for action in self.actions:
+            methodName = METHODNAME_ACTION % action["type"]
+            parameters = action.get("parameters", {})
+            self.tracer.debug("[%s] calling action %s" % (self.fullName,
+                                                         methodName))
+            method = getattr(self, methodName)
+            tries = action.get("retries", self.providerInstance.retrySettings["retries"])
+            delay = action.get("delayInSeconds", self.providerInstance.retrySettings["delayInSeconds"])
+            backoff = action.get("backoffMultiplier", self.providerInstance.retrySettings["backoffMultiplier"])
+
+            try :
+               retry_call(method, fkwargs=parameters, tries=tries, delay=delay, backoff=backoff, logger=self.tracer)
+               self.success = True
+            except Exception as e:
+               self.tracer.error("[%s] error executing action %s, Exception %s, skipping remaining actions" % (self.fullName,
+                                                                                                               methodName,
+                                                                                                               e))
+               self.checkMessage = str(e)
+               # reraise exception since we have no valid JSON result string to return
+               raise
+      finally:
+         self.duration = TimeUtils.getElapsedMilliseconds(startTime)      
+
       return self.generateJsonString()
 
    # Method to generate a JSON object that can be ingested into Log Analytics

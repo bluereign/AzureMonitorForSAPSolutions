@@ -40,6 +40,25 @@ class AzureInstanceMetadataService:
                               params = params,
                               headers = headers)
 
+   # return expected resource ID of the sapmon Managed Service Identity
+   @staticmethod
+   def getSapmonMsiResourceId(subscriptionId: str, 
+                              resourceGroupName: str, 
+                              sapmonId: str) -> str:
+      # /subscriptions/{subscriptionId}/resourceGroups/sapmon-rg-{sapmonId}/providers/Microsoft.ManagedIdentity/userAssignedIdentities/sapmon-msi-{sapmonId}
+
+      if (not subscriptionId):
+         raise "cannot create sapmon MSI resourceId with empty subscriptionId"
+      if (not resourceGroupName):
+         raise "cannot create sapmon MSI resourceId with empty resourceGroupName"
+      if (not sapmonId):
+         raise "cannot create sapmon MSI resourceId with empty sapmonId"
+
+      return "/subscriptions/%s/resourceGroups/%s/providers/Microsoft.ManagedIdentity/userAssignedIdentities/sapmon-msi-%s" % \
+              (subscriptionId,
+              resourceGroupName,
+              sapmonId)
+
    # Call IMDS to get the compute instance of the collector VM
    @staticmethod
    def getComputeInstance(tracer: logging.Logger,
@@ -60,15 +79,23 @@ class AzureInstanceMetadataService:
    @staticmethod
    def getAuthToken(tracer: logging.Logger,
                     resource: Optional[str] = None,
-                    msiClientId: Optional[str] = None) -> Tuple[str, str]:
+                    msiClientId: Optional[str] = None,
+                    msiResourceId: Optional[str] = None) -> Tuple[str, str]:
       tracer.info("getting auth token for resource=%s%s" % (resource, ", msiClientId=%s" % msiClientId if msiClientId else ""))
       authToken = None
       if not resource:
          resource = AzureInstanceMetadataService.resource
+
+      requestParams = {"resource": resource}
+      if (msiResourceId):
+         requestParams['mi_res_id'] = msiResourceId
+      if (msiClientId):
+         requestParams['client_id'] = msiClientId
+
       try:
          result = AzureInstanceMetadataService._sendRequest(tracer,
                                                             "identity/oauth2/token",
-                                                            params = {"resource": resource, "client_id": msiClientId})
+                                                            params=requestParams)
          authToken, msiClientId = result["access_token"], result["client_id"]
       except Exception as e:
          tracer.critical("could not get auth token (%s)" % e)
@@ -113,7 +140,9 @@ class AzureKeyVault:
                     secretName: str) -> bool:
       self.tracer.info("deleting KeyVault secret %s" % secretName)
       try:
-         self.kv_client.begin_delete_secret(secretName)
+         poller = self.kv_client.begin_delete_secret(secretName)
+         poller.wait()
+         self.kv_client.purge_deleted_secret(secretName)
       except Exception as e:
          self.tracer.critical("could not delete KeyVault secret (%s)" % e)
          return False
@@ -227,35 +256,34 @@ x-ms-date:%s
 
 ###############################################################################
 
-# Provide access to an Azure Storage Queue (used for payload logging)
-class AzureStorageQueue():
+# Provide access to an Azure Storage Account (used for payload logging)
+class AzureStorageAccount():
     accountName = None
-    name = None
     resourceGroup = None
     subscriptionId = None
     token = {}
     tracer = None
 
-    # Retrieve the name of the storage account and storage queue
+    # Retrieve the name of the storage account
     def __init__(self,
                  tracer: logging.Logger,
                  sapmonId: str,
                  msiClientId: str,
                  subscriptionId: str,
-                 resourceGroup: str,
-                 queueName: str):
+                 resourceGroup: str):
         self.tracer = tracer
-        self.tracer.info("initializing Storage Queue instance")
+        self.tracer.info("initializing Storage Account instance")
         self.accountName = STORAGE_ACCOUNT_NAMING_CONVENTION % sapmonId
-        self.name = queueName
-        
+
         self.token = ManagedIdentityCredential(client_id = msiClientId)
+        
         self.subscriptionId = subscriptionId
         self.resourceGroup = resourceGroup
 
-    # Get the access key to the storage queue
+    # Get the access key to the storage account
     def getAccessKey(self) -> str:
-        self.tracer.info("getting access key for Storage Queue")
+        self.tracer.info("getting access key for Storage Account")
+
         storageclient = StorageManagementClient(credential = self.token,
                                                 subscription_id = self.subscriptionId)
 
@@ -263,6 +291,6 @@ class AzureStorageQueue():
         storageKeys = storageclient.storage_accounts.list_keys(resource_group_name = self.resourceGroup,
                                                                account_name = self.accountName)
         if storageKeys is None or len(storageKeys.keys) == 0 :
-           self.log.error("could not retrieve storage keys of the storage account %s" % self.accountName)
+           self.tracer.error("could not retrieve storage keys of the storage account %s" % self.accountName)
            return None
         return storageKeys.keys[0].value

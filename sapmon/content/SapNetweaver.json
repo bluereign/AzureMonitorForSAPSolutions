@@ -34,7 +34,7 @@
             "description": "SAP Netweaver ABAPGetWPTable",
             "customLog": "SapNetweaver_ABAPGetWPTable",
             "frequencySecs": 60,
-            "includeInCustomerAnalytics": true,
+            "includeInCustomerAnalytics": false,
             "actions": [
                 {
                     "type": "ExecuteGenericWebServiceRequest",
@@ -57,8 +57,8 @@
                     "type": "ExecuteGenericWebServiceRequest",
                     "parameters": {
                         "apiName": "GetQueueStatistic",
-                        "filterFeatures": ["MESSAGESERVER", "ENQUE", "ENQREP"],
-                        "filterType": "exclude"
+                        "filterFeatures": ["ABAP", "J2EE", "JEE"],
+                        "filterType": "include"
                     }
                 }
             ]
@@ -77,6 +77,45 @@
                         "filterFeatures": ["ENQUE"],
                         "filterType": "include"
                     }
+                }
+            ]
+        },
+        {
+            "name": "SMON_Metrics",
+            "description": "SAP Netweaver SMON",
+            "customLog": "SapNetweaver_SMON",
+            "frequencySecs": 60,
+            "includeInCustomerAnalytics": true,
+            "actions": [
+                {
+                    "type": "GetSmonAnalysisMetrics",
+                    "parameters": { }
+                }
+            ]
+        },
+        {
+            "name": "SWNC_Workload_Metrics",
+            "description": "SAP Netweaver SWNC",
+            "customLog": "SapNetweaver_SWNC",
+            "frequencySecs": 300,
+            "includeInCustomerAnalytics": true,
+            "actions": [
+                {
+                    "type": "GetSwncWorkloadMetrics",
+                    "parameters": { }
+                }
+            ]
+        },
+        {
+            "name": "SDF_Short_Dumps_Metrics",
+            "description": "SAP Netweaver Short Dumps",
+            "customLog": "SapNetweaver_ShortDumps",
+            "frequencySecs": 300,
+            "includeInCustomerAnalytics": false,
+            "actions": [
+                {
+                    "type": "GetShortDumpsMetrics",
+                    "parameters": { }
                 }
             ]
         }

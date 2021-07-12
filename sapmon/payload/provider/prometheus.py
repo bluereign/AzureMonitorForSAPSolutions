@@ -57,7 +57,7 @@ class prometheusProviderInstance(ProviderInstance):
         if not self.metricsUrl:
             self.tracer.error("[%s] PrometheusUrl cannot be empty" % self.fullName)
             return False
-        self.instance_name = urllib.parse.urlparse(self.metricsUrl).netloc
+        self.instance_name = self.name
         return True
 
     def validate(self) -> bool:
@@ -171,18 +171,119 @@ class prometheusProviderCheck(ProviderCheck):
             # If none of the above matched, just let the item through
             return True
 
+        def nodestatus_from_rhel(samplename):
+            #parse sample name to retrieve status
+            newstatus = samplename[len("ha_cluster_pacemaker_nodes_status_"):]
+            if newstatus == "on_fail":
+                newstatus = "onfail"
+            return newstatus
+
+        def map_ha_cluster_pacemaker_nodes_status(sample):
+            labels = sample.labels
+            labels["status"] = nodestatus_from_rhel(sample.name)
+            labels["node"] = labels["instname"]
+            labels["type"] = "member"
+            newsample = Sample("ha_cluster_pacemaker_nodes",labels,sample.value,sample.timestamp)
+            return newsample
+
+        def map_ha_cluster_pacemaker_resources(sample):
+            labels = sample.labels
+            labels["status"] = sample.name[len("ha_cluster_pacemaker_resources_status_"):]
+            # look for node name after colon
+            parts = labels["instname"].split(':', 2)
+            if len(parts) == 2:
+                labels["resource"] = parts[0]
+                labels["node"] = parts[1]
+            else:
+                labels["resource"] = labels["instname"]
+                labels["node"] = labels["hostname"]
+            newsample = Sample("ha_cluster_pacemaker_resources",labels,sample.value,sample.timestamp)
+            return newsample
+
+        def map_ha_cluster_pacemaker_resources_managed(sample):
+            labels = sample.labels
+            labels["managed"] =  "True"
+            parts = labels["instname"].split(':', 2)
+            if len(parts) == 2:
+                labels["resource"] = parts[0]
+                labels["node"] = parts[1]
+            else:
+                labels["resource"] = labels["instname"]
+                labels["node"] = labels["hostname"]
+            newsample = Sample("ha_cluster_pacemaker_resources",labels,sample.value,sample.timestamp)
+            return newsample
+
+        def map_ha_cluster_pacemaker_fail_migration(sample):
+            labels = sample.labels
+            parts = labels["instname"].split(':', 2)
+            if len(parts) == 2:
+                labels["resource"] = parts[1]
+                labels["node"] = parts[0]
+            else:
+                labels["resource"] = labels["instname"]
+                labels["node"] = labels["hostname"]
+            newsample = Sample(sample.name,labels,sample.value,sample.timestamp)
+            return newsample;
+
+        test_dict = {"ha_cluster_pacemaker_nodes_status_dc": map_ha_cluster_pacemaker_nodes_status,
+                     "ha_cluster_pacemaker_nodes_status_online": map_ha_cluster_pacemaker_nodes_status,
+                     "ha_cluster_pacemaker_nodes_status_standby": map_ha_cluster_pacemaker_nodes_status,
+                     "ha_cluster_pacemaker_nodes_status_standby_on_fail": map_ha_cluster_pacemaker_nodes_status,
+                     "ha_cluster_pacemaker_nodes_status_maintenance": map_ha_cluster_pacemaker_nodes_status,
+                     "ha_cluster_pacemaker_nodes_status_pending": map_ha_cluster_pacemaker_nodes_status,
+                     "ha_cluster_pacemaker_nodes_status_shutdown": map_ha_cluster_pacemaker_nodes_status,
+                     "ha_cluster_pacemaker_nodes_status_expected_up": map_ha_cluster_pacemaker_nodes_status,
+                     "ha_cluster_pacemaker_nodes_status_unclean": map_ha_cluster_pacemaker_nodes_status,
+                     "ha_cluster_pacemaker_resources_managed": map_ha_cluster_pacemaker_resources_managed,
+                     "ha_cluster_pacemaker_resources_status_active": map_ha_cluster_pacemaker_resources,
+                     "ha_cluster_pacemaker_resources_status_blocked": map_ha_cluster_pacemaker_resources,
+                     "ha_cluster_pacemaker_resources_status_failed": map_ha_cluster_pacemaker_resources,
+                     "ha_cluster_pacemaker_resources_status_failure_ignored": map_ha_cluster_pacemaker_resources,
+                     "ha_cluster_pacemaker_resources_status_orphaned": map_ha_cluster_pacemaker_resources,
+                     "ha_cluster_pacemaker_fail_count": map_ha_cluster_pacemaker_fail_migration,
+                     "ha_cluster_pacemaker_migration_threshold": map_ha_cluster_pacemaker_fail_migration
+
+                     }
+
+        def rhel_to_suse_metric(samples):
+            new_samples = []
+            for s in samples:
+                mapfunc = test_dict.get(s.name)
+                if mapfunc != None:
+                    newsample = mapfunc(s)
+                else:
+                    newsample = s
+                new_samples.append(newsample)
+            return new_samples
+
+
         prometheusMetricsText = self.lastResult[0]
         includeRegex = self.lastResult[1]
         suppressIfZeroRegex = self.lastResult[2]
         resultSet = list()
 
+        def isDCnodedata(filteredsamples):
+            for sample in filteredsamples:
+                if sample.name == "ha_cluster_pacemaker_nodes":
+                    if sample.labels["status"] == "dc":
+                        if sample.labels["node"] == self.providerInstance.metadata['hostname']:
+                            return True
+            return False
+
+
         self.tracer.info("[%s] converting result set into JSON" % self.fullName)
+
         try:
+            allfilteredsamples = []
             if not prometheusMetricsText:
                 raise ValueError("Empty result from prometheus instance %s", self.providerInstance.instance)
             for family in filter(filter_prometheus_metric,
                                  text_string_to_metric_families(prometheusMetricsText)):
-                resultSet.extend(map(prometheusSample2Dict, filter(filter_prometheus_sample, family.samples)))
+                allfilteredsamples.extend(filter(filter_prometheus_sample, rhel_to_suse_metric(family.samples)))
+            if isDCnodedata(allfilteredsamples):
+                resultSet.extend(map(prometheusSample2Dict, allfilteredsamples))
+            else:
+                self.tracer.info("non-dc data from [%s]" % self.providerInstance.instance_name)
         except ValueError as e:
             self.tracer.error("[%s] Could not parse prometheus metrics (%s): %s" % (self.fullName, e, prometheusMetricsText))
             resultSet.append(prometheusSample2Dict(Sample("up", dict(), 0)))
